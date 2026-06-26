@@ -2,7 +2,8 @@
 잠실 우성아파트(1~3차) 네이버부동산 매매 매물 수집기.
 
 매일 1회 실행되어 fin.land.naver.com(신 네이버부동산)에서 단지의 매매(A1) 매물
-목록을 가져와 SQLite DB(data/naverland.db)에 누적 저장한다.
+목록을 가져와 SQLite DB(data/naverland.db)에 누적 저장하고,
+보기 편한 엑셀 파일(data/naverland.xlsx)로도 함께 내보낸다.
 
 사이트 구조 변경 이력: 과거 new.land.naver.com 기반 구조는 폐기되었고(2026년 기준),
 현재는 m.land.naver.com 검색 -> fin.land.naver.com/complexes/{complexNo} 로
@@ -19,12 +20,31 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 from playwright.sync_api import sync_playwright
 
 # 검색에 사용할 단지명 후보들. 네이버부동산은 "1차/2차/3차"처럼 정확한 차수가
 # 붙어야 단지를 매칭해주는 경우가 많아 후보를 여러 개 둔다.
 COMPLEX_NAME_QUERIES = ["잠실우성1차", "잠실우성2차", "잠실우성3차", "잠실우성아파트"]
 DB_PATH = Path(__file__).parent / "data" / "naverland.db"
+XLSX_PATH = Path(__file__).parent / "data" / "naverland.xlsx"
+
+# 엑셀에 보여줄 컬럼명(한글) 매핑
+EXCEL_COLUMNS = {
+    "collected_at": "수집일시",
+    "complex_no": "단지코드",
+    "complex_name": "단지명",
+    "article_no": "매물번호",
+    "pyeong_supply": "공급평형",
+    "pyeong_exclusive": "전용평형",
+    "area_supply_m2": "공급면적(m2)",
+    "area_exclusive_m2": "전용면적(m2)",
+    "price_text": "매매가",
+    "price_won": "매매가(원)",
+    "floor_info": "층정보",
+    "direction": "방향",
+    "confirm_date": "등록/확인일",
+}
 
 DDL = """
 CREATE TABLE IF NOT EXISTS listings (
@@ -241,6 +261,23 @@ def upsert_articles(conn, complex_no: str, complex_name: str, articles: list[dic
     return len(rows)
 
 
+def export_to_excel(conn):
+    """DB 전체 누적 데이터를 보기 편한 엑셀 파일로 내보낸다."""
+    df = pd.read_sql_query(
+        f"SELECT {', '.join(EXCEL_COLUMNS.keys())} FROM listings "
+        "ORDER BY collected_at DESC, complex_name, pyeong_supply",
+        conn,
+    )
+    df = df.rename(columns=EXCEL_COLUMNS)
+    XLSX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(XLSX_PATH, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="매물목록", index=False)
+        worksheet = writer.sheets["매물목록"]
+        for col_cells in worksheet.columns:
+            max_len = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
+            worksheet.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 40)
+
+
 def main():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -283,7 +320,8 @@ def main():
 
         browser.close()
 
-    print(f"수집 완료: 총 매물 {total_articles}건 확인, 신규 적재 {total_new}건")
+    export_to_excel(conn)
+    print(f"수집 완료: 총 매물 {total_articles}건 확인, 신규 적재 {total_new}건, 엑셀 내보내기 완료({XLSX_PATH})")
     conn.close()
 
 
