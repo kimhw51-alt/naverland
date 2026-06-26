@@ -5,9 +5,17 @@
 목록을 가져와 SQLite DB(data/naverland.db)에 누적 저장하고,
 보기 편한 엑셀 파일(data/naverland.xlsx)로도 함께 내보낸다.
 
-사이트 구조 변경 이력: 과거 new.land.naver.com 기반 구조는 폐기되었고(2026년 기준),
-현재는 m.land.naver.com 검색 -> fin.land.naver.com/complexes/{complexNo} 로
-리다이렉트되는 구조다. complexNo는 모바일 검색 리다이렉트를 통해 알아낸다.
+사이트 구조 변경 이력(2026-06-26 기준):
+- new.land.naver.com, m.land.naver.com 은 완전히 폐기되어 전부 404.
+- fin.land.naver.com 자체도 기본 navigator.webdriver=true 인 헤드리스
+  브라우저는 financial.pstatic.net의 404 페이지로 강제 리다이렉트한다(봇 차단).
+  Playwright context에서 navigator.webdriver를 숨기면(stealth) 정상 동작한다.
+- fin.land.naver.com 내부에는 자유 텍스트 검색 API가 없어, complexNo는
+  search.naver.com 통합검색 결과에 노출되는 "fin.land.naver.com/complexes/{no}"
+  링크를 파싱해서 알아낸다.
+- 매물 목록은 단지 페이지의 "매매" 탭 클릭 시 호출되는
+  POST https://fin.land.naver.com/front-api/v1/complex/article/list 로 가져온다.
+  (사이트 최상단 GNB의 "매물" 링크는 로그인이 필요한 별도 페이지이므로 사용하지 않음)
 
 실행: python scraper.py
 """
@@ -23,11 +31,16 @@ from pathlib import Path
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
-# 검색에 사용할 단지명 후보들. 네이버부동산은 "1차/2차/3차"처럼 정확한 차수가
-# 붙어야 단지를 매칭해주는 경우가 많아 후보를 여러 개 둔다.
-COMPLEX_NAME_QUERIES = ["잠실우성1차", "잠실우성2차", "잠실우성3차", "잠실우성아파트"]
+# 검색에 사용할 단지명 후보들.
+COMPLEX_NAME_QUERIES = ["잠실우성아파트", "잠실우성1차", "잠실우성2차", "잠실우성3차"]
 DB_PATH = Path(__file__).parent / "data" / "naverland.db"
 XLSX_PATH = Path(__file__).parent / "data" / "naverland.xlsx"
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+STEALTH_INIT_SCRIPT = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
 
 # 엑셀에 보여줄 컬럼명(한글) 매핑
 EXCEL_COLUMNS = {
@@ -59,61 +72,60 @@ CREATE TABLE IF NOT EXISTS listings (
     area_supply_m2 REAL,
     area_exclusive_m2 REAL,
     price_won INTEGER,               -- 매매가 (원)
-    price_text TEXT,                 -- 네이버 표시 그대로 (예: "25억 5,000")
+    price_text TEXT,                 -- 표시용 가격 문자열 (예: "25억 5,000")
     floor_info TEXT,
     direction TEXT,
-    confirm_date TEXT,                -- 네이버 "확인" 날짜 (매물 등록/갱신 기준일)
+    confirm_date TEXT,                -- 매물 등록/갱신 확인 날짜
     raw_json TEXT,
     UNIQUE(article_no, collected_at)
 );
 """
 
 
-def m2_to_pyeong(m2: float) -> float:
+def m2_to_pyeong(m2) -> float | None:
+    if not m2:
+        return None
     return round(m2 / 3.3058, 1)
 
 
-def parse_price_to_won(price_text) -> int | None:
-    """'25억 5,000' / '9억' 같은 네이버 가격 표기를 원 단위 정수로 변환."""
-    if not price_text or not isinstance(price_text, str):
-        return None
-    text = price_text.replace(",", "").strip()
-    eok = 0
-    man = 0
-    m = re.search(r"(\d+)억", text)
-    if m:
-        eok = int(m.group(1))
-    rest = re.sub(r"\d+억", "", text).strip()
-    if rest:
-        m2_ = re.search(r"(\d+)", rest)
-        if m2_:
-            man = int(m2_.group(1))
-    if eok == 0 and man == 0:
-        return None
-    return eok * 100_000_000 + man * 10_000
+def won_to_price_text(won: int) -> str:
+    """원 단위 정수를 '25억 5,000' 같은 네이버 표기 스타일로 변환."""
+    eok, man = divmod(won, 100_000_000)
+    man = man // 10_000
+    if eok and man:
+        return f"{eok}억 {man:,}"
+    if eok:
+        return f"{eok}억"
+    return f"{man:,}"
 
 
-def find_complex_no(page, query: str) -> tuple[str, str] | None:
-    """모바일 검색결과 리다이렉트를 이용해 (complexNo, complexName)을 알아낸다.
-    매칭되는 단지가 없으면 None.
-    """
+def new_stealth_context(browser):
+    ctx = browser.new_context(
+        user_agent=USER_AGENT,
+        locale="ko-KR",
+        extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9"},
+    )
+    ctx.add_init_script(STEALTH_INIT_SCRIPT)
+    return ctx
+
+
+def find_complex_no(page, query: str) -> str | None:
+    """search.naver.com 통합검색 결과에서 fin.land.naver.com/complexes/{no} 링크를 찾는다."""
     kw = urllib.parse.quote(query)
     try:
         page.goto(
-            f"https://m.land.naver.com/search/result/{kw}",
+            f"https://search.naver.com/search.naver?query={kw}",
             wait_until="load",
             timeout=20000,
         )
     except Exception:
         return None
-    page.wait_for_timeout(2500)
-
-    m = re.search(r"/complexes/(\d+)", page.url) or re.search(r"complexNumber=(\d+)", page.url)
+    page.wait_for_timeout(1500)
+    html = page.content()
+    m = re.search(r"fin\.land\.naver\.com/complexes/(\d+)", html)
     if not m:
-        # 검색결과 없음 (그대로 search/result 페이지에 머무름) 등
         return None
-    complex_no = m.group(1)
-    return complex_no, query
+    return m.group(1)
 
 
 def fetch_complex_name(page, complex_no: str) -> str:
@@ -123,11 +135,7 @@ def fetch_complex_name(page, complex_no: str) -> str:
         )
         if resp.status == 200:
             data = resp.json()
-            name = (
-                data.get("complexName")
-                or data.get("name")
-                or data.get("data", {}).get("complexName")
-            )
+            name = data.get("result", {}).get("name")
             if name:
                 return name
     except Exception:
@@ -136,114 +144,72 @@ def fetch_complex_name(page, complex_no: str) -> str:
 
 
 def collect_sale_articles(page, complex_no: str) -> list[dict]:
-    """단지 페이지에서 매매(A1) 매물 목록 API 응답을 가로채 모은다.
+    """단지의 매매(A1) 매물 목록을 front-api에서 페이지네이션하며 모두 가져온다."""
+    articles: list[dict] = []
+    last_info: list = []
+    body = {
+        "size": 30,
+        "complexNumber": complex_no,
+        "tradeTypes": ["A1"],
+        "pyeongTypes": [],
+        "dongNumbers": [],
+        "userChannelType": "PC",
+        "articleSortType": "RANKING_DESC",
+        "lastInfo": [],
+    }
 
-    fin.land.naver.com의 article 목록 API 정확한 경로/파라미터가 바뀔 수 있으므로,
-    "front-api" 응답 중 매물처럼 보이는 리스트(JSON 배열 안에 가격/면적 필드가 있는
-    dict들)를 휴리스틱하게 수집한다.
-    """
-    articles: dict[str, dict] = {}
+    for _ in range(50):  # 안전 상한
+        body["lastInfo"] = last_info
+        resp = page.request.post(
+            "https://fin.land.naver.com/front-api/v1/complex/article/list",
+            data=json.dumps(body),
+            headers={"content-type": "application/json"},
+        )
+        if resp.status != 200:
+            break
+        data = resp.json()
+        result = data.get("result", {})
+        page_list = result.get("list", [])
+        articles.extend(page_list)
+        if not result.get("hasNextPage") or not page_list:
+            break
+        last_info = result.get("lastInfo", [])
+        if not last_info:
+            break
+        time.sleep(1)
 
-    def looks_like_article(d: dict) -> bool:
-        if not isinstance(d, dict):
-            return False
-        keys = set(d.keys())
-        price_keys = {"dealOrWarrantPrc", "price", "dealPrice", "priceText"}
-        area_keys = {"area1", "area2", "exclusiveArea", "supplyArea"}
-        id_keys = {"articleNo", "articleId", "id"}
-        return bool(keys & price_keys) and bool(keys & area_keys) and bool(keys & id_keys)
-
-    def extract_lists(obj):
-        """JSON 응답 어디에 있든 매물처럼 보이는 리스트를 재귀적으로 찾는다."""
-        found = []
-        if isinstance(obj, dict):
-            for v in obj.values():
-                found.extend(extract_lists(v))
-        elif isinstance(obj, list):
-            if obj and all(looks_like_article(x) for x in obj):
-                found.append(obj)
-            else:
-                for x in obj:
-                    found.extend(extract_lists(x))
-        return found
-
-    def on_response(response):
-        url = response.url
-        if "fin.land.naver.com/front-api" not in url:
-            return
-        if "article" not in url.lower() and "complex" not in url.lower():
-            return
-        try:
-            data = response.json()
-        except Exception:
-            return
-        for lst in extract_lists(data):
-            for art in lst:
-                key = str(art.get("articleNo") or art.get("articleId") or art.get("id"))
-                articles[key] = art
-
-    page.on("response", on_response)
-
-    page.goto(
-        f"https://fin.land.naver.com/complexes/{complex_no}",
-        wait_until="networkidle",
-        timeout=30000,
-    )
-    page.wait_for_timeout(2500)
-
-    # 매매 탭이 기본 선택이 아닐 수 있으므로 "매매" 텍스트가 있는 탭을 한 번 클릭해본다.
-    try:
-        sale_tab = page.get_by_text("매매", exact=False).first
-        sale_tab.click(timeout=3000)
-        page.wait_for_timeout(1500)
-    except Exception:
-        pass
-
-    # 매물 목록 스크롤 영역을 찾아 끝까지 스크롤하며 추가 로딩을 유도한다.
-    try:
-        list_panel = page.locator("[class*='list'], [class*='List']").first
-        last_count = -1
-        stable_rounds = 0
-        for _ in range(40):
-            list_panel.evaluate("el => el.scrollTo(0, el.scrollHeight)")
-            page.wait_for_timeout(700)
-            if len(articles) == last_count:
-                stable_rounds += 1
-                if stable_rounds >= 3:
-                    break
-            else:
-                stable_rounds = 0
-            last_count = len(articles)
-    except Exception:
-        pass
-
-    page.remove_listener("response", on_response)
-    return list(articles.values())
+    return articles
 
 
 def upsert_articles(conn, complex_no: str, complex_name: str, articles: list[dict]) -> int:
     collected_at = datetime.now().isoformat(timespec="seconds")
     rows = []
     for art in articles:
-        area_supply = art.get("area1") or art.get("supplyArea")
-        area_exclusive = art.get("area2") or art.get("exclusiveArea")
-        price_text = art.get("dealOrWarrantPrc") or art.get("priceText") or art.get("price")
+        info = art.get("representativeArticleInfo", {})
+        space = info.get("spaceInfo", {})
+        price = info.get("priceInfo", {})
+        detail = info.get("articleDetail", {})
+
+        area_supply = space.get("supplySpace")
+        area_exclusive = space.get("exclusiveSpace")
+        deal_price = price.get("dealPrice")
+
         rows.append(
             (
                 collected_at,
                 complex_no,
                 complex_name,
-                str(art.get("articleNo") or art.get("articleId") or art.get("id")),
+                str(info.get("articleNumber")),
                 "A1",
-                m2_to_pyeong(area_supply) if area_supply else None,
-                m2_to_pyeong(area_exclusive) if area_exclusive else None,
+                m2_to_pyeong(area_supply),
+                m2_to_pyeong(area_exclusive),
                 area_supply,
                 area_exclusive,
-                parse_price_to_won(price_text),
-                price_text,
-                art.get("floorInfo") or art.get("floor"),
-                art.get("direction"),
-                art.get("articleConfirmYmd") or art.get("confirmDate") or art.get("registDate"),
+                deal_price,
+                won_to_price_text(deal_price) if deal_price else None,
+                detail.get("floorInfo"),
+                detail.get("direction"),
+                info.get("verificationInfo", {}).get("articleConfirmDate"),
                 json.dumps(art, ensure_ascii=False),
             )
         )
@@ -288,24 +254,29 @@ def main():
     seen_complex_no = set()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            )
+        browser = p.chromium.launch(
+            headless=True, args=["--disable-blink-features=AutomationControlled"]
         )
+        ctx = new_stealth_context(browser)
+        page = ctx.new_page()
 
         for query in COMPLEX_NAME_QUERIES:
-            found = find_complex_no(page, query)
+            complex_no = find_complex_no(page, query)
             time.sleep(2)  # 과도한 요청으로 인한 차단(429) 방지
-            if not found:
+            if not complex_no:
                 print(f"'{query}' 검색 결과 없음, 스킵", file=sys.stderr)
                 continue
-            complex_no, _ = found
             if complex_no in seen_complex_no:
                 continue
             seen_complex_no.add(complex_no)
+
+            # 단지 페이지를 한 번 로드해 세션/쿠키를 확보한다.
+            page.goto(
+                f"https://fin.land.naver.com/complexes/{complex_no}",
+                wait_until="load",
+                timeout=30000,
+            )
+            page.wait_for_timeout(1500)
 
             complex_name = fetch_complex_name(page, complex_no)
             print(f"complexNo={complex_no} complexName={complex_name}", file=sys.stderr)
